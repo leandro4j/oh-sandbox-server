@@ -15,8 +15,15 @@ import socket
 import time
 from contextlib import suppress
 from dataclasses import dataclass
+from http.cookiejar import CookieJar
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import urlopen
+from urllib.request import (
+    HTTPCookieProcessor,
+    OpenerDirector,
+    build_opener,
+    urlopen,
+)
 from uuid import uuid4
 
 import docker  # type: ignore[import-untyped]
@@ -28,6 +35,7 @@ from docker.errors import (  # type: ignore[import-untyped]
     NotFound,
 )
 from fastapi import FastAPI
+from playwright.async_api import async_playwright, expect
 
 from openhands.app_server.sandbox import sandbox_router as sandbox_router_module
 from openhands.app_server.sandbox.docker_sandbox_service import (
@@ -39,6 +47,7 @@ from openhands.app_server.sandbox.preset_sandbox_spec_service import (
 )
 from openhands.app_server.sandbox.sandbox_models import (
     AGENT_SERVER,
+    VSCODE,
     SandboxInfo,
     SandboxPage,
     SandboxStatus,
@@ -50,7 +59,8 @@ pytestmark = pytest.mark.integration
 
 RUN_INTEGRATION_ENV = 'RUN_DOCKER_INTEGRATION_TESTS'
 IMAGE_ENV = 'SANDBOX_INTEGRATION_IMAGE'
-MARKER_PATH = '/tmp/openhands-issue-2-marker'
+MARKER_FILENAME = 'openhands-editor-marker.txt'
+MARKER_PATH = f'/workspace/project/{MARKER_FILENAME}'
 APPLICATION_PORT = 8080
 DATABASE_PORT = 5432
 
@@ -94,6 +104,7 @@ database_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 database_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 database_socket.bind(("0.0.0.0", {DATABASE_PORT}))
 database_socket.listen()
+marker_path.parent.mkdir(parents=True, exist_ok=True)
 marker_path.write_text(marker, encoding="utf-8")
 threading.Thread(target=http_server.serve_forever, daemon=True).start()
 
@@ -109,6 +120,7 @@ class RuntimeSnapshot:
     sandbox_id: str
     session_api_key: str
     agent_server_url: str
+    vscode_url: str
     application_url: str
     database_url: str
     marker: str
@@ -139,6 +151,11 @@ def _build_sandbox_service(
                 name=AGENT_SERVER,
                 description='Agent Server runtime',
                 container_port=8000,
+            ),
+            ExposedPort(
+                name=VSCODE,
+                description='VS Code editor',
+                container_port=8001,
             ),
             ExposedPort(
                 name='APPLICATION',
@@ -187,6 +204,77 @@ def _http_marker(url: str) -> str:
     with urlopen(url, timeout=5) as response:
         assert response.status == 200
         return response.read().decode('utf-8')
+
+
+def _http_status(url: str, opener: OpenerDirector | None = None) -> int:
+    if opener is None:
+        opener = build_opener(HTTPCookieProcessor(CookieJar()))
+    try:
+        with opener.open(url, timeout=5) as response:
+            return response.status
+    except HTTPError as error:
+        return error.code
+
+
+def _editor_url(info: SandboxInfo, opener: OpenerDirector | None = None) -> str:
+    url = _exposed_url(info, VSCODE)
+    parsed = urlsplit(url)
+    assert parsed.path == f'/vscode/{info.id}/'
+    assert f'tkn={info.session_api_key}' in parsed.query
+    assert _http_status(url, opener) == 200
+    return url
+
+
+def _url_is_unreachable(url: str) -> bool:
+    try:
+        with urlopen(url, timeout=5):
+            return False
+    except (HTTPError, OSError, TimeoutError, URLError):
+        return True
+
+
+async def _assert_editor_workspace(
+    page, url: str, expected_marker: str, reload: bool = False
+) -> None:
+    if reload:
+        await page.reload(wait_until='domcontentloaded', timeout=30000)
+    else:
+        await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+    marker_item = page.locator(f'[role="treeitem"][aria-label="{MARKER_FILENAME}"]')
+    await marker_item.wait_for(state='visible', timeout=30000)
+    await marker_item.dblclick()
+    await expect(page.locator('.view-lines')).to_contain_text(
+        expected_marker, timeout=30000
+    )
+
+
+async def _assert_editor_workspaces(
+    first_url: str,
+    first_marker: str,
+    second_url: str,
+    second_marker: str,
+) -> None:
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        context = await browser.new_context()
+        try:
+            first_page = await context.new_page()
+            second_page = await context.new_page()
+            await asyncio.gather(
+                _assert_editor_workspace(first_page, first_url, first_marker),
+                _assert_editor_workspace(second_page, second_url, second_marker),
+            )
+            await asyncio.gather(
+                _assert_editor_workspace(
+                    first_page, first_url, first_marker, reload=True
+                ),
+                _assert_editor_workspace(
+                    second_page, second_url, second_marker, reload=True
+                ),
+            )
+        finally:
+            await context.close()
+            await browser.close()
 
 
 def _database_marker(url: str) -> str:
@@ -276,6 +364,7 @@ def _owned_containers(client: docker.DockerClient, prefix: str):
 def _snapshot(container, info: SandboxInfo, marker: str) -> RuntimeSnapshot:
     _wait_for_marker(container, marker)
     agent_server_url = _exposed_url(info, AGENT_SERVER)
+    vscode_url = _editor_url(info)
     application_url = _exposed_url(info, 'APPLICATION')
     database_url = _exposed_url(info, 'DATABASE')
     assert _http_marker(application_url) == marker
@@ -284,6 +373,7 @@ def _snapshot(container, info: SandboxInfo, marker: str) -> RuntimeSnapshot:
         sandbox_id=info.id,
         session_api_key=info.session_api_key or '',
         agent_server_url=agent_server_url,
+        vscode_url=vscode_url,
         application_url=application_url,
         database_url=database_url,
         marker=marker,
@@ -318,7 +408,7 @@ def docker_client() -> docker.DockerClient:
 async def test_two_conversations_are_isolated_across_lifecycle_and_restart(
     docker_client: docker.DockerClient,
 ):
-    """Prove the Sandbox Server-owned two-runtime acceptance scenario."""
+    """Prove two-runtime routing; path scoping fixes cookie collisions, not hostile-service security."""
     run_id = uuid4().hex[:12]
     prefix = f'oh-issue-2-{run_id}-'
     conversation_markers = {
@@ -378,6 +468,20 @@ async def test_two_conversations_are_isolated_across_lifecycle_and_restart(
         assert _exposed_url(first_info, AGENT_SERVER) != _exposed_url(
             second_info, AGENT_SERVER
         )
+        browser_opener = build_opener(HTTPCookieProcessor(CookieJar()))
+        first_editor_url = _editor_url(first_info, browser_opener)
+        second_editor_url = _editor_url(second_info, browser_opener)
+        assert first_editor_url != second_editor_url
+        assert first_info.session_api_key not in second_editor_url
+        assert second_info.session_api_key not in first_editor_url
+        # Reuse the same cookie jar to model one browser alternating between
+        # both editors; path-scoped cookies must keep each workspace routed.
+        assert _http_status(first_editor_url, browser_opener) == 200
+        assert _http_status(second_editor_url, browser_opener) == 200
+        wrong_token_url = first_editor_url.replace(
+            f'tkn={first_info.session_api_key}', 'tkn=invalid-editor-token'
+        )
+        assert _http_status(wrong_token_url) in (401, 403)
 
         first_container = docker_client.containers.get(first.id)
         second_container = docker_client.containers.get(second.id)
@@ -388,6 +492,12 @@ async def test_two_conversations_are_isolated_across_lifecycle_and_restart(
         )
         second_snapshot = _snapshot(
             second_container, second_info, conversation_markers['conversation-b']
+        )
+        await _assert_editor_workspaces(
+            first_snapshot.vscode_url,
+            first_snapshot.marker,
+            second_snapshot.vscode_url,
+            second_snapshot.marker,
         )
 
         # Both containers bind the same application and database ports inside
@@ -428,6 +538,7 @@ async def test_two_conversations_are_isolated_across_lifecycle_and_restart(
         )
         resumed_first = await _wait_for_api_running(restarted_control_client, first.id)
         assert resumed_first.session_api_key == first_snapshot.session_api_key
+        assert _editor_url(resumed_first) == first_snapshot.vscode_url
         assert _exec_checked(first_container, ['cat', MARKER_PATH]) == (
             first_snapshot.marker
         )
@@ -462,6 +573,8 @@ async def test_two_conversations_are_isolated_across_lifecycle_and_restart(
 
         await _api_action(restarted_control_client, 'DELETE', f'/sandboxes/{first.id}')
         await _api_action(restarted_control_client, 'DELETE', f'/sandboxes/{second.id}')
+        assert _url_is_unreachable(first_snapshot.vscode_url)
+        assert _url_is_unreachable(second_snapshot.vscode_url)
         assert _owned_containers(docker_client, prefix) == []
         assert docker_client.containers.get(unrelated.name).status == 'running'
         assert all(
