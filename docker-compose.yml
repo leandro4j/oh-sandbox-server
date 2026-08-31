@@ -7,18 +7,27 @@ services:
     image: openhands-sandbox-server:latest
     container_name: openhands-sandbox-server-${DATE:-}
     environment:
-      - AGENT_SERVER_IMAGE_REPOSITORY=${AGENT_SERVER_IMAGE_REPOSITORY:-ghcr.io/openhands/agent-server}
-      - AGENT_SERVER_IMAGE_TAG=${AGENT_SERVER_IMAGE_TAG:-1.30.0-python}
+      # The SDK issue builds this exact local tag from its frozen revision.
+      # Override either value when using a different pinned image.
+      - AGENT_SERVER_IMAGE_REPOSITORY=${AGENT_SERVER_IMAGE_REPOSITORY:-agent-box/${AGENT_BOX_MVP_PROJECT:-agent-box-mvp-run-id}-software-agent-sdk}
+      - AGENT_SERVER_IMAGE_TAG=${AGENT_SERVER_IMAGE_TAG:-local}
+      # The control plane is never started without an explicit key. Keep the
+      # SDK verifier's variable name as the primary Compose input.
+      - SESSION_API_KEY=${AGENT_BOX_CONTROL_PLANE_KEY:?AGENT_BOX_CONTROL_PLANE_KEY must be set}
+      # Agent Canvas's source frontend runs on this origin by default.
+      - OH_PERMITTED_CORS_ORIGINS_0=${AGENT_BOX_CANVAS_ORIGIN:-http://localhost:3001}
+      # Keep at least two sandboxes available for concurrent conversations.
+      - SANDBOX_MAX_NUM_SANDBOXES=${SANDBOX_MAX_NUM_SANDBOXES:-2}
+      - SANDBOX_HOST_PORT=${SANDBOX_SERVER_PORT:-3000}
+      - SANDBOX_CONTAINER_URL_PATTERN=${SANDBOX_CONTAINER_URL_PATTERN:-http://localhost:{port}}
       #- SANDBOX_USER_ID=${SANDBOX_USER_ID:-1234} # enable this only if you want a specific non-root sandbox user but you will have to manually adjust permissions of ~/.openhands for this user
-      - WORKSPACE_MOUNT_PATH=${WORKSPACE_BASE:-$PWD/workspace}
     ports:
-      - "3000:3000"
+      - "${SANDBOX_SERVER_PORT:-3000}:3000"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ~/.openhands:/.openhands
-      - ${WORKSPACE_BASE:-$PWD/workspace}:/opt/workspace_base
     pull_policy: build
     stdin_open: true
     tty: true
