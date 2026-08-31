@@ -406,9 +406,18 @@ class TestDockerSandboxService:
         mock_container.attrs = {
             'Created': '2024-01-15T10:30:00.000000000Z',
             'Config': {
-                'Env': ['OH_SESSION_API_KEYS_0=test_session_key', 'TEST_VAR=test_value']
+                'Env': [
+                    'OH_SESSION_API_KEYS_0=test_session_key',
+                    'TEST_VAR=test_value',
+                ],
+                'WorkingDir': '/workspace',
             },
-            'NetworkSettings': {'Ports': {}},
+            'NetworkSettings': {
+                'Ports': {
+                    '8000/tcp': [{'HostPort': '12345'}],
+                    '8001/tcp': [{'HostPort': '12346'}],
+                }
+            },
         }
 
         service.docker_client.containers.run.return_value = mock_container
@@ -425,6 +434,9 @@ class TestDockerSandboxService:
         # Verify
         assert result is not None
         assert result.id == 'oh-test-test_container_id'
+        assert result.session_api_key == 'test_session_key'
+        assert result.exposed_urls is not None
+        assert result.exposed_urls[0].url == 'http://localhost:12345'
 
         # Verify cleanup was called with the correct limit
         mock_cleanup.assert_called_once_with(2)

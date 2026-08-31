@@ -14,8 +14,10 @@ services:
       # The control plane is never started without an explicit key. Keep the
       # SDK verifier's variable name as the primary Compose input.
       - SESSION_API_KEY=${AGENT_BOX_CONTROL_PLANE_KEY:?AGENT_BOX_CONTROL_PLANE_KEY must be set}
-      # Agent Canvas's source frontend runs on this origin by default.
-      - OH_PERMITTED_CORS_ORIGINS_0=${AGENT_BOX_CANVAS_ORIGIN:-http://localhost:3001}
+      # Agent Canvas's source frontend runs on this exact origin.
+      - OH_PERMITTED_CORS_ORIGINS_0=http://localhost:3001
+      # Every conversation gets its own sandbox in this MVP profile.
+      - OH_SANDBOX_NO_GROUPING=true
       # Keep at least two sandboxes available for concurrent conversations.
       - SANDBOX_MAX_NUM_SANDBOXES=${SANDBOX_MAX_NUM_SANDBOXES:-2}
       - SANDBOX_HOST_PORT=${SANDBOX_SERVER_PORT:-3000}

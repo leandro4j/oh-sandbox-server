@@ -19,9 +19,8 @@ def test_compose_requires_the_frozen_runtime_and_control_plane_key():
     assert environment['AGENT_SERVER_IMAGE_REPOSITORY'].endswith('-software-agent-sdk}')
     assert environment['AGENT_SERVER_IMAGE_TAG'] == '${AGENT_SERVER_IMAGE_TAG:-local}'
     assert environment['SESSION_API_KEY'].startswith('${AGENT_BOX_CONTROL_PLANE_KEY:?')
-    assert environment['OH_PERMITTED_CORS_ORIGINS_0'] == (
-        '${AGENT_BOX_CANVAS_ORIGIN:-http://localhost:3001}'
-    )
+    assert environment['OH_PERMITTED_CORS_ORIGINS_0'] == 'http://localhost:3001'
+    assert environment['OH_SANDBOX_NO_GROUPING'] == 'true'
     assert environment['SANDBOX_MAX_NUM_SANDBOXES'] == (
         '${SANDBOX_MAX_NUM_SANDBOXES:-2}'
     )
