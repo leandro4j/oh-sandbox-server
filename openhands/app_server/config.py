@@ -345,6 +345,10 @@ def config_from_env() -> AppServerConfig:
                 docker_sandbox_kwargs['host_port'] = int(
                     os.environ['SANDBOX_HOST_PORT']
                 )
+            if os.getenv('SANDBOX_MAX_NUM_SANDBOXES'):
+                docker_sandbox_kwargs['max_num_sandboxes'] = int(
+                    os.environ['SANDBOX_MAX_NUM_SANDBOXES']
+                )
             if os.getenv('SANDBOX_CONTAINER_URL_PATTERN'):
                 docker_sandbox_kwargs['container_url_pattern'] = os.environ[
                     'SANDBOX_CONTAINER_URL_PATTERN'

@@ -44,6 +44,16 @@ from openhands.app_server.utils.docker_utils import (
 
 _logger = logging.getLogger(__name__)
 STARTUP_GRACE_SECONDS = 15
+AGENT_SERVER_SESSION_API_KEY_VARIABLE = 'SESSION_API_KEY'
+
+
+def _get_container_session_api_key(
+    env_vars: dict[str, str | None],
+) -> str | None:
+    """Read the session key accepted by both Agent Server API generations."""
+    return env_vars.get(SESSION_API_KEY_VARIABLE) or env_vars.get(
+        AGENT_SERVER_SESSION_API_KEY_VARIABLE
+    )
 
 
 def _get_use_host_network_default() -> bool:
@@ -161,7 +171,7 @@ class DockerSandboxService(SandboxService):
         if status == SandboxStatus.RUNNING:
             # Get session API key first
             env = self._get_container_env_vars(container)
-            session_api_key = env.get(SESSION_API_KEY_VARIABLE)
+            session_api_key = _get_container_session_api_key(env)
 
             # Get the exposed port mappings
             exposed_urls = []
@@ -353,7 +363,7 @@ class DockerSandboxService(SandboxService):
                 ):
                     # Check if this container has the matching session API key
                     env_vars = self._get_container_env_vars(container)
-                    container_session_key = env_vars.get(SESSION_API_KEY_VARIABLE)
+                    container_session_key = _get_container_session_api_key(env_vars)
 
                     if container_session_key == session_api_key:
                         return await self._container_to_checked_sandbox_info(container)
@@ -373,7 +383,8 @@ class DockerSandboxService(SandboxService):
                     self.container_name_prefix
                 ):
                     env_vars = self._get_container_env_vars(container)
-                    if env_vars.get(SESSION_API_KEY_VARIABLE) == session_api_key:
+                    container_session_key = _get_container_session_api_key(env_vars)
+                    if container_session_key == session_api_key:
                         return SandboxRecord(
                             id=container.name,
                             created_by_user_id=None,
@@ -416,6 +427,10 @@ class DockerSandboxService(SandboxService):
         # Prepare environment variables
         env_vars = sandbox_spec.initial_env.copy()
         env_vars[SESSION_API_KEY_VARIABLE] = session_api_key
+        # The full Agent Server accepts both the V0 and V1 names. Keep the
+        # compatibility alias so the pinned image and older clients share the
+        # same per-sandbox credential.
+        env_vars[AGENT_SERVER_SESSION_API_KEY_VARIABLE] = session_api_key
         env_vars[WEBHOOK_CALLBACK_VARIABLE] = (
             f'http://host.docker.internal:{self.host_port}/api/v1/webhooks'
         )

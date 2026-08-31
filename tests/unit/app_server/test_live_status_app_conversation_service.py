@@ -317,6 +317,16 @@ class TestLiveStatusAppConversationService:
         self.service._load_hooks_from_workspace = AsyncMock(return_value=None)
 
     @pytest.mark.asyncio
+    async def test_no_grouping_profile_overrides_persisted_user_setting(self):
+        """The standalone profile must isolate every conversation in its own sandbox."""
+        self.mock_user_context.get_user_info = AsyncMock(return_value=self.mock_user)
+
+        with patch.dict(os.environ, {'OH_SANDBOX_NO_GROUPING': 'true'}, clear=False):
+            result = await self.service._get_sandbox_grouping_strategy()
+
+        assert result == SandboxGroupingStrategy.NO_GROUPING
+
+    @pytest.mark.asyncio
     async def test_seed_sandbox_profiles_upserts_resolved_keys_and_prunes(self):
         """Pushes each profile to the sandbox with its key resolved (managed key
         injected, BYOR key kept), then deletes profiles that no longer exist on

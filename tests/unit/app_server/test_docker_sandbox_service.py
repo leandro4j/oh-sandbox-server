@@ -390,11 +390,14 @@ class TestDockerSandboxService:
 
     @patch('openhands.app_server.sandbox.docker_sandbox_service.base62.encodebytes')
     @patch('os.urandom')
-    async def test_start_sandbox_success(self, mock_urandom, mock_encodebytes, service):
+    async def test_start_sandbox_success(
+        self, mock_urandom, mock_encodebytes, service, caplog
+    ):
         """Test successful sandbox startup."""
         # Setup
         mock_urandom.side_effect = [b'container_id', b'session_key']
         mock_encodebytes.side_effect = ['test_container_id', 'test_session_key']
+        service.mounts = []
 
         mock_container = MagicMock()
         mock_container.name = 'oh-test-test_container_id'
@@ -403,9 +406,18 @@ class TestDockerSandboxService:
         mock_container.attrs = {
             'Created': '2024-01-15T10:30:00.000000000Z',
             'Config': {
-                'Env': ['OH_SESSION_API_KEYS_0=test_session_key', 'TEST_VAR=test_value']
+                'Env': [
+                    'OH_SESSION_API_KEYS_0=test_session_key',
+                    'TEST_VAR=test_value',
+                ],
+                'WorkingDir': '/workspace',
             },
-            'NetworkSettings': {'Ports': {}},
+            'NetworkSettings': {
+                'Ports': {
+                    '8000/tcp': [{'HostPort': '12345'}],
+                    '8001/tcp': [{'HostPort': '12346'}],
+                }
+            },
         }
 
         service.docker_client.containers.run.return_value = mock_container
@@ -422,6 +434,9 @@ class TestDockerSandboxService:
         # Verify
         assert result is not None
         assert result.id == 'oh-test-test_container_id'
+        assert result.session_api_key == 'test_session_key'
+        assert result.exposed_urls is not None
+        assert result.exposed_urls[0].url == 'http://localhost:12345'
 
         # Verify cleanup was called with the correct limit
         mock_cleanup.assert_called_once_with(2)
@@ -436,9 +451,12 @@ class TestDockerSandboxService:
         assert (
             call_args[1]['environment']['OH_SESSION_API_KEYS_0'] == 'test_session_key'
         )
+        assert call_args[1]['environment']['SESSION_API_KEY'] == 'test_session_key'
         assert call_args[1]['ports'] == {8000: 12345, 8001: 12346}
+        assert call_args[1]['volumes'] == {}
         assert call_args[1]['working_dir'] == '/workspace'
         assert call_args[1]['detach'] is True
+        assert 'test_session_key' not in caplog.text
 
     async def test_start_sandbox_with_spec_id(self, service, mock_sandbox_spec_service):
         """Test starting sandbox with specific spec ID."""
@@ -1372,6 +1390,21 @@ class TestDockerSandboxServiceInjectorFromEnv:
             assert config.sandbox is not None
             assert config.sandbox.host_port == 4000
             assert config.sandbox.container_url_pattern == 'http://192.168.1.100:{port}'
+
+    def test_config_from_env_with_sandbox_capacity(self):
+        """The standalone Docker profile can set a two-sandbox capacity."""
+        import os
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {'SANDBOX_MAX_NUM_SANDBOXES': '2'}, clear=False):
+            import openhands.app_server.config as config_module
+            from openhands.app_server.config import config_from_env
+
+            config_module._global_config = None
+
+            config = config_from_env()
+            assert config.sandbox is not None
+            assert config.sandbox.max_num_sandboxes == 2
 
 
 class TestDockerSandboxServiceHostNetwork:

@@ -3,6 +3,7 @@ import importlib.metadata
 import io
 import json
 import logging
+import os
 import zipfile
 from collections import defaultdict
 from collections.abc import Mapping
@@ -151,6 +152,7 @@ _conversation_info_type_adapter = TypeAdapter(list[ConversationInfo | None])
 _logger = logging.getLogger(__name__)
 
 _EXPORT_LOCK_KEY_PREFIX = 'app_conversation_export'
+_FORCE_NO_GROUPING_ENV = 'OH_SANDBOX_NO_GROUPING'
 
 
 def _resolve_title_llm_profile(user: UserInfo) -> str | None:
@@ -300,6 +302,9 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
 
     async def _get_sandbox_grouping_strategy(self) -> SandboxGroupingStrategy:
         """Get the sandbox grouping strategy from user settings."""
+        if os.getenv(_FORCE_NO_GROUPING_ENV, '').lower() in ('true', '1', 'yes'):
+            return SandboxGroupingStrategy.NO_GROUPING
+
         user_info = await self.user_context.get_user_info()
         return user_info.sandbox_grouping_strategy
 

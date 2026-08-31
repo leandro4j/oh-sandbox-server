@@ -39,12 +39,22 @@ make test
 
 ## Docker
 
+Build the frozen full Agent Server image from the SDK checkout first, then set
+the control-plane key before starting Compose:
+
 ```bash
+export AGENT_BOX_MVP_PROJECT=agent-box-mvp-run-id
+export AGENT_BOX_CONTROL_PLANE_KEY="set-this-outside-the-repository"
 docker compose up --build
 ```
 
-The Compose setup mounts the Docker socket and a local workspace so the server
-can manage sandbox containers.
+The required SDK build revision is `704cbe6015e3d59cabe04632175d99df2d448999`.
+Compose derives the local image tag as
+`agent-box/${AGENT_BOX_MVP_PROJECT}-software-agent-sdk:local`, allows the Agent
+Canvas origin `http://localhost:3001`, forces no sandbox grouping, publishes the
+control plane on port `3000`, and keeps two sandboxes available. Set
+`SANDBOX_SERVER_PORT` when the published port differs. Sandbox containers use
+Docker's ephemeral writable layer; no host workspace is mounted into them.
 
 ## Extraction provenance
 
