@@ -37,6 +37,20 @@ make lint
 make test
 ```
 
+The real two-sandbox isolation proof is an explicit Docker lane. Build the
+frozen Agent Server image first, then run it with that image name:
+
+```bash
+SANDBOX_INTEGRATION_IMAGE="agent-box/${AGENT_BOX_MVP_PROJECT}-software-agent-sdk:local" \
+make test-integration
+```
+
+The test creates two owned runtimes plus one unrelated container, and removes
+only resources it created. It asserts no-grouping inputs, distinct runtime
+identities and namespaces, same internal application/database ports, lifecycle
+independence, restart discovery/resume, and cleanup. The lane requires a
+reachable Docker daemon and is intentionally excluded from `make test`.
+
 ## Docker
 
 Build the frozen full Agent Server image from the SDK checkout first, then set
