@@ -10,7 +10,7 @@ This module tests the Docker sandbox service implementation, focusing on:
 """
 
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import httpx
 import pytest
@@ -452,6 +452,10 @@ class TestDockerSandboxService:
             call_args[1]['environment']['OH_SESSION_API_KEYS_0'] == 'test_session_key'
         )
         assert call_args[1]['environment']['SESSION_API_KEY'] == 'test_session_key'
+        assert (
+            call_args[1]['environment']['OH_VSCODE_BASE_PATH']
+            == '/vscode/oh-test-test_container_id'
+        )
         assert call_args[1]['ports'] == {8000: 12345, 8001: 12346}
         assert call_args[1]['volumes'] == {}
         assert call_args[1]['working_dir'] == '/workspace'
@@ -1034,7 +1038,7 @@ class TestDockerSandboxService:
         vscode_url = next(url for url in result.exposed_urls if url.name == VSCODE)
         assert (
             vscode_url.url
-            == 'http://localhost:12346/?tkn=session_key_123&folder=/workspace'
+            == 'http://localhost:12346/vscode/oh-test-abc123/?tkn=session_key_123&folder=/workspace'
         )
 
     async def test_container_to_sandbox_info_invalid_created_time(self, service):
@@ -1085,9 +1089,13 @@ class TestDockerSandboxService:
         assert result.session_api_key == 'session_key_123'
 
         # Verify health check was called with Docker-internal URL
-        service.httpx_client.get.assert_called_once_with(
-            'http://host.docker.internal:12345/health'
-        )
+        assert service.httpx_client.get.await_args_list == [
+            call('http://host.docker.internal:12345/health'),
+            call(
+                'http://host.docker.internal:12346/vscode/oh-test-abc123/'
+                '?tkn=session_key_123&folder=/workspace'
+            ),
+        ]
 
     @patch(
         'openhands.app_server.utils.docker_utils.is_running_in_docker',
@@ -1111,10 +1119,14 @@ class TestDockerSandboxService:
         assert result.exposed_urls is not None
         assert result.session_api_key == 'session_key_123'
 
-        # Verify health check was called with original localhost URL
-        service.httpx_client.get.assert_called_once_with(
-            'http://localhost:12345/health'
-        )
+        # Verify both Agent Server and editor readiness checks use localhost.
+        assert service.httpx_client.get.await_args_list == [
+            call('http://localhost:12345/health'),
+            call(
+                'http://localhost:12346/vscode/oh-test-abc123/'
+                '?tkn=session_key_123&folder=/workspace'
+            ),
+        ]
 
     async def test_container_to_checked_sandbox_info_health_check_failure(
         self, service, mock_running_container
@@ -1134,12 +1146,40 @@ class TestDockerSandboxService:
         assert result.exposed_urls is None
         assert result.session_api_key is None
 
+    async def test_container_to_checked_sandbox_info_editor_readiness_failure(
+        self, service, mock_running_container
+    ):
+        """Do not publish an editor URL until the editor accepts its token."""
+        service.httpx_client.get.side_effect = [
+            service.httpx_client.get.return_value,
+            httpx.HTTPError('VSCode is not ready'),
+        ]
+
+        result = await service._container_to_checked_sandbox_info(
+            mock_running_container
+        )
+
+        assert result is not None
+        assert result.status == SandboxStatus.ERROR
+        assert result.exposed_urls is None
+        assert result.session_api_key is None
+        assert service.httpx_client.get.await_args_list == [
+            call('http://localhost:12345/health'),
+            call(
+                'http://localhost:12346/vscode/oh-test-abc123/'
+                '?tkn=session_key_123&folder=/workspace'
+            ),
+        ]
+
     async def test_container_to_checked_sandbox_info_no_health_check(
         self, service, mock_running_container
     ):
-        """Test when health check is disabled."""
+        """Test editor readiness when the Agent Server health check is disabled."""
         # Setup
         service.health_check_path = None
+        response = service.httpx_client.get.return_value
+        response.status_code = 302
+        response.is_error = False
 
         # Execute
         result = await service._container_to_checked_sandbox_info(
@@ -1149,7 +1189,12 @@ class TestDockerSandboxService:
         # Verify
         assert result is not None
         assert result.status == SandboxStatus.RUNNING
-        service.httpx_client.get.assert_not_called()
+        assert service.httpx_client.get.await_args_list == [
+            call(
+                'http://localhost:12346/vscode/oh-test-abc123/'
+                '?tkn=session_key_123&folder=/workspace'
+            ),
+        ]
 
     async def test_container_to_checked_sandbox_info_no_exposed_urls(
         self, service, mock_paused_container
@@ -1562,7 +1607,7 @@ class TestDockerSandboxServiceHostNetwork:
         vscode_url = next(url for url in result.exposed_urls if url.name == VSCODE)
         assert (
             vscode_url.url
-            == 'http://localhost:8001/?tkn=session_key_123&folder=/workspace'
+            == 'http://localhost:8001/vscode/oh-test-abc123/?tkn=session_key_123&folder=/workspace'
         )
         assert vscode_url.port == 8001
 

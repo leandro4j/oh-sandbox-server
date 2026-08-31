@@ -5,6 +5,7 @@ import socket
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import AsyncGenerator
+from urllib.parse import quote
 
 import base62
 import docker
@@ -45,6 +46,7 @@ from openhands.app_server.utils.docker_utils import (
 _logger = logging.getLogger(__name__)
 STARTUP_GRACE_SECONDS = 15
 AGENT_SERVER_SESSION_API_KEY_VARIABLE = 'SESSION_API_KEY'
+VSCODE_BASE_PATH_VARIABLE = 'OH_VSCODE_BASE_PATH'
 
 
 def _get_container_session_api_key(
@@ -152,6 +154,66 @@ class DockerSandboxService(SandboxService):
                 result[env_var] = None
         return result
 
+    def _get_vscode_base_path(
+        self,
+        container_name: str,
+        env_vars: dict[str, str | None] | None = None,
+    ) -> str:
+        """Return the VS Code base path configured for a sandbox.
+
+        New containers always receive a path derived from their sandbox ID. Read
+        the container value when it is available so discovery after a control
+        plane restart keeps using the path the editor was started with.
+        """
+        if env_vars:
+            configured_path = env_vars.get(VSCODE_BASE_PATH_VARIABLE)
+            if configured_path:
+                return configured_path.rstrip('/')
+        return f'/vscode/{quote(container_name, safe="")}'
+
+    def _build_vscode_url(
+        self,
+        container,
+        host_port: int,
+        session_api_key: str | None,
+        env_vars: dict[str, str | None],
+    ) -> str | None:
+        """Build an authenticated, sandbox-scoped VS Code URL."""
+        if not session_api_key:
+            return None
+
+        base_url = self.container_url_pattern.format(port=host_port).rstrip('/')
+        base_path = self._get_vscode_base_path(container.name, env_vars)
+        working_dir = container.attrs.get('Config', {}).get('WorkingDir', '')
+        return (
+            f'{base_url}{base_path}/?tkn={quote(session_api_key, safe="")}'
+            f'&folder={quote(working_dir, safe="/")}'
+        )
+
+    def _build_exposed_url(
+        self,
+        container,
+        exposed_port: ExposedPort,
+        host_port: int,
+        session_api_key: str | None,
+        env_vars: dict[str, str | None],
+    ) -> ExposedUrl | None:
+        """Build an exposed service URL for a Docker port mapping."""
+        if exposed_port.name == VSCODE:
+            url = self._build_vscode_url(
+                container, host_port, session_api_key, env_vars
+            )
+            if url is None:
+                return None
+        else:
+            url = self.container_url_pattern.format(port=host_port)
+
+        return ExposedUrl(
+            name=exposed_port.name,
+            url=url,
+            port=exposed_port.container_port,
+        )
+
     async def _container_to_sandbox_info(self, container) -> SandboxInfo | None:
         """Convert Docker container to SandboxInfo."""
         # Convert Docker status to runtime status
@@ -167,11 +229,12 @@ class DockerSandboxService(SandboxService):
         # Get URL and session key for running containers
         exposed_urls = None
         session_api_key = None
+        env_vars: dict[str, str | None] = {}
 
         if status == SandboxStatus.RUNNING:
             # Get session API key first
-            env = self._get_container_env_vars(container)
-            session_api_key = _get_container_session_api_key(env)
+            env_vars = self._get_container_env_vars(container)
+            session_api_key = _get_container_session_api_key(env_vars)
 
             # Get the exposed port mappings
             exposed_urls = []
@@ -184,19 +247,15 @@ class DockerSandboxService(SandboxService):
                 # Host network mode: container ports are directly accessible on host
                 for exposed_port in self.exposed_ports:
                     host_port = exposed_port.container_port
-                    url = self.container_url_pattern.format(port=host_port)
-
-                    # VSCode URLs require the api_key and working dir
-                    if exposed_port.name == VSCODE:
-                        url += f'/?tkn={session_api_key}&folder={container.attrs["Config"]["WorkingDir"]}'
-
-                    exposed_urls.append(
-                        ExposedUrl(
-                            name=exposed_port.name,
-                            url=url,
-                            port=exposed_port.container_port,
-                        )
+                    exposed_url = self._build_exposed_url(
+                        container,
+                        exposed_port,
+                        host_port,
+                        session_api_key,
+                        env_vars,
                     )
+                    if exposed_url is not None:
+                        exposed_urls.append(exposed_url)
             else:
                 # Bridge network mode: use port bindings
                 port_bindings = container.attrs.get('NetworkSettings', {}).get(
@@ -215,19 +274,15 @@ class DockerSandboxService(SandboxService):
                                 None,
                             )
                             if matching_port:
-                                url = self.container_url_pattern.format(port=host_port)
-
-                                # VSCode URLs require the api_key and working dir
-                                if matching_port.name == VSCODE:
-                                    url += f'/?tkn={session_api_key}&folder={container.attrs["Config"]["WorkingDir"]}'
-
-                                exposed_urls.append(
-                                    ExposedUrl(
-                                        name=matching_port.name,
-                                        url=url,
-                                        port=matching_port.container_port,
-                                    )
+                                exposed_url = self._build_exposed_url(
+                                    container,
+                                    matching_port,
+                                    host_port,
+                                    session_api_key,
+                                    env_vars,
                                 )
+                                if exposed_url is not None:
+                                    exposed_urls.append(exposed_url)
 
         if not container.image.tags:
             _logger.debug(
@@ -249,25 +304,53 @@ class DockerSandboxService(SandboxService):
         sandbox_info = await self._container_to_sandbox_info(container)
         if (
             sandbox_info
-            and self.health_check_path is not None
             and sandbox_info.exposed_urls
-        ):
-            app_server_url = next(
-                exposed_url.url
-                for exposed_url in sandbox_info.exposed_urls
-                if exposed_url.name == AGENT_SERVER
+            and (
+                self.health_check_path is not None
+                or any(url.name == VSCODE for url in sandbox_info.exposed_urls)
             )
+        ):
             try:
-                # When running in Docker, replace localhost hostname with host.docker.internal for internal requests
-                app_server_url = replace_localhost_hostname_for_docker(app_server_url)
+                if self.health_check_path is not None:
+                    app_server_url = next(
+                        exposed_url.url
+                        for exposed_url in sandbox_info.exposed_urls
+                        if exposed_url.name == AGENT_SERVER
+                    )
+                    # When running in Docker, replace localhost hostname with
+                    # host.docker.internal for internal requests.
+                    app_server_url = replace_localhost_hostname_for_docker(
+                        app_server_url
+                    )
+                    response = await self.httpx_client.get(
+                        f'{app_server_url}{self.health_check_path}'
+                    )
+                    response.raise_for_status()
 
-                response = await self.httpx_client.get(
-                    f'{app_server_url}{self.health_check_path}'
+                vscode_url = next(
+                    (
+                        exposed_url.url
+                        for exposed_url in sandbox_info.exposed_urls
+                        if exposed_url.name == VSCODE
+                    ),
+                    None,
                 )
-                response.raise_for_status()
+                if vscode_url is not None:
+                    # A running Agent Server does not imply that OpenVSCode is
+                    # ready. Probe the authenticated editor URL before exposing
+                    # it to clients.
+                    vscode_url = replace_localhost_hostname_for_docker(vscode_url)
+                    response = await self.httpx_client.get(vscode_url)
+                    # OpenVSCode redirects the initial request to its canonical
+                    # path. Treat redirects as ready; only 4xx/5xx responses
+                    # mean the authenticated editor is unavailable.
+                    if response.is_error:
+                        response.raise_for_status()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                failed_response = getattr(exc, 'response', None)
+                response_status = getattr(failed_response, 'status_code', None)
                 # Get the started_at from the docker container info and fallback to sandbox created_at
                 try:
                     state = container.attrs['State']
@@ -281,13 +364,18 @@ class DockerSandboxService(SandboxService):
                     seconds=self.startup_grace_seconds
                 ):
                     _logger.info(
-                        f'Sandbox server not running: {app_server_url} : {exc}'
+                        'Sandbox services not ready for %s (%s, status=%s)',
+                        sandbox_info.id,
+                        type(exc).__name__,
+                        response_status,
                     )
                     sandbox_info.status = SandboxStatus.ERROR
                 else:
                     _logger.debug(
-                        f'Sandbox server not yet available (still starting): '
-                        f'{app_server_url} : {exc}'
+                        'Sandbox services not yet available (still starting): %s (%s, status=%s)',
+                        sandbox_info.id,
+                        type(exc).__name__,
+                        response_status,
                     )
                     sandbox_info.status = SandboxStatus.STARTING
                 sandbox_info.exposed_urls = None
@@ -431,6 +519,7 @@ class DockerSandboxService(SandboxService):
         # compatibility alias so the pinned image and older clients share the
         # same per-sandbox credential.
         env_vars[AGENT_SERVER_SESSION_API_KEY_VARIABLE] = session_api_key
+        env_vars[VSCODE_BASE_PATH_VARIABLE] = self._get_vscode_base_path(container_name)
         env_vars[WEBHOOK_CALLBACK_VARIABLE] = (
             f'http://host.docker.internal:{self.host_port}/api/v1/webhooks'
         )
@@ -523,7 +612,7 @@ class DockerSandboxService(SandboxService):
                 devices=devices,
             )
 
-            sandbox_info = await self._container_to_sandbox_info(container)
+            sandbox_info = await self._container_to_checked_sandbox_info(container)
             assert sandbox_info is not None
             return sandbox_info
 
