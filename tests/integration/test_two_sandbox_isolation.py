@@ -2,9 +2,9 @@
 
 This is deliberately an explicit local lane. The Product Integration command
 builds the frozen full Agent Server image and supplies its tag through
-``SANDBOX_INTEGRATION_IMAGE``. The test talks to the public DockerSandboxService
-interface and uses Docker's runtime observations only for namespace and
-resource assertions that mocks cannot prove.
+``SANDBOX_INTEGRATION_IMAGE``. The test mounts the public Sandbox Server router
+over a DockerSandboxService and uses Docker's runtime observations only for
+namespace and resource assertions that mocks cannot prove.
 """
 
 from __future__ import annotations
@@ -27,7 +27,9 @@ from docker.errors import (  # type: ignore[import-untyped]
     ImageNotFound,
     NotFound,
 )
+from fastapi import FastAPI
 
+from openhands.app_server.sandbox import sandbox_router as sandbox_router_module
 from openhands.app_server.sandbox.docker_sandbox_service import (
     DockerSandboxService,
     ExposedPort,
@@ -38,9 +40,11 @@ from openhands.app_server.sandbox.preset_sandbox_spec_service import (
 from openhands.app_server.sandbox.sandbox_models import (
     AGENT_SERVER,
     SandboxInfo,
+    SandboxPage,
     SandboxStatus,
 )
 from openhands.app_server.sandbox.sandbox_spec_models import SandboxSpecInfo
+from openhands.app_server.utils.dependencies import check_session_api_key
 
 pytestmark = pytest.mark.integration
 
@@ -112,7 +116,7 @@ class RuntimeSnapshot:
     network_namespace: str
 
 
-def _service(
+def _build_sandbox_service(
     image: str,
     prefix: str,
     httpx_client: httpx.AsyncClient,
@@ -155,7 +159,7 @@ def _service(
     )
 
 
-def _url(info: SandboxInfo, name: str) -> str:
+def _exposed_url(info: SandboxInfo, name: str) -> str:
     assert info.exposed_urls is not None
     for exposed_url in info.exposed_urls:
         if exposed_url.name == name:
@@ -163,7 +167,7 @@ def _url(info: SandboxInfo, name: str) -> str:
     raise AssertionError(f'{name} URL missing from sandbox {info.id}')
 
 
-def _exec(container, command: list[str]) -> str:
+def _exec_checked(container, command: list[str]) -> str:
     result = container.exec_run(command)
     output = result.output.decode('utf-8', errors='replace').strip()
     assert result.exit_code == 0, f'{command!r} failed: {output}'
@@ -198,7 +202,7 @@ def _wait_for_marker(container, expected: str) -> None:
     last_output = ''
     while time.monotonic() < deadline:
         try:
-            last_output = _exec(container, ['cat', MARKER_PATH])
+            last_output = _exec_checked(container, ['cat', MARKER_PATH])
         except AssertionError:
             pass
         if last_output == expected:
@@ -207,17 +211,58 @@ def _wait_for_marker(container, expected: str) -> None:
     raise AssertionError(f'marker did not become ready: {last_output!r}')
 
 
-async def _wait_for_running(
-    service: DockerSandboxService, sandbox_id: str
+def _build_sandbox_api(service: DockerSandboxService) -> FastAPI:
+    """Mount the real sandbox router with a Docker service dependency."""
+    app = FastAPI()
+    app.dependency_overrides[check_session_api_key] = lambda: None
+    app.dependency_overrides[
+        sandbox_router_module.sandbox_service_dependency.dependency
+    ] = lambda: service
+    app.dependency_overrides[
+        sandbox_router_module.user_context_dependency.dependency
+    ] = lambda: None
+    app.include_router(sandbox_router_module.router, prefix='/api/v1')
+    return app
+
+
+async def _api_start_sandbox(client: httpx.AsyncClient) -> SandboxInfo:
+    response = await client.post('/sandboxes')
+    response.raise_for_status()
+    return SandboxInfo.model_validate(response.json())
+
+
+async def _api_get_sandbox(
+    client: httpx.AsyncClient, sandbox_id: str
+) -> SandboxInfo | None:
+    response = await client.get('/sandboxes', params={'id': sandbox_id})
+    response.raise_for_status()
+    payload = response.json()
+    assert len(payload) == 1
+    return SandboxInfo.model_validate(payload[0]) if payload[0] else None
+
+
+async def _wait_for_api_running(
+    client: httpx.AsyncClient, sandbox_id: str
 ) -> SandboxInfo:
     deadline = time.monotonic() + 30
     last_info: SandboxInfo | None = None
     while time.monotonic() < deadline:
-        last_info = await service.get_sandbox(sandbox_id)
+        last_info = await _api_get_sandbox(client, sandbox_id)
         if last_info and last_info.status == SandboxStatus.RUNNING:
             return last_info
         await asyncio.sleep(0.25)
     raise AssertionError(f'sandbox did not become running: {last_info!r}')
+
+
+async def _api_search_sandboxes(client: httpx.AsyncClient) -> SandboxPage:
+    response = await client.get('/sandboxes/search')
+    response.raise_for_status()
+    return SandboxPage.model_validate(response.json())
+
+
+async def _api_action(client: httpx.AsyncClient, method: str, path: str) -> None:
+    response = await client.request(method, path)
+    response.raise_for_status()
 
 
 def _owned_containers(client: docker.DockerClient, prefix: str):
@@ -230,9 +275,9 @@ def _owned_containers(client: docker.DockerClient, prefix: str):
 
 def _snapshot(container, info: SandboxInfo, marker: str) -> RuntimeSnapshot:
     _wait_for_marker(container, marker)
-    agent_server_url = _url(info, AGENT_SERVER)
-    application_url = _url(info, 'APPLICATION')
-    database_url = _url(info, 'DATABASE')
+    agent_server_url = _exposed_url(info, AGENT_SERVER)
+    application_url = _exposed_url(info, 'APPLICATION')
+    database_url = _exposed_url(info, 'DATABASE')
     assert _http_marker(application_url) == marker
     assert _database_marker(database_url) == marker
     return RuntimeSnapshot(
@@ -242,11 +287,11 @@ def _snapshot(container, info: SandboxInfo, marker: str) -> RuntimeSnapshot:
         application_url=application_url,
         database_url=database_url,
         marker=marker,
-        pid_namespace=_exec(
+        pid_namespace=_exec_checked(
             container,
             ['python3', '-c', 'import os; print(os.readlink("/proc/1/ns/pid"))'],
         ),
-        network_namespace=_exec(
+        network_namespace=_exec_checked(
             container,
             ['python3', '-c', 'import os; print(os.readlink("/proc/1/ns/net"))'],
         ),
@@ -273,7 +318,7 @@ def docker_client() -> docker.DockerClient:
 async def test_two_conversations_are_isolated_across_lifecycle_and_restart(
     docker_client: docker.DockerClient,
 ):
-    """Prove the complete two-runtime acceptance scenario at the Docker seam."""
+    """Prove the Sandbox Server-owned two-runtime acceptance scenario."""
     run_id = uuid4().hex[:12]
     prefix = f'oh-issue-2-{run_id}-'
     conversation_markers = {
@@ -284,10 +329,18 @@ async def test_two_conversations_are_isolated_across_lifecycle_and_restart(
     unrelated = None
     httpx_client = httpx.AsyncClient()
     restarted_httpx_client = httpx.AsyncClient()
-    service = _service(INTEGRATION_IMAGE, prefix, httpx_client, docker_client)
-    restarted_service = _service(
+    service = _build_sandbox_service(
+        INTEGRATION_IMAGE, prefix, httpx_client, docker_client
+    )
+    restarted_service = _build_sandbox_service(
         INTEGRATION_IMAGE, prefix, restarted_httpx_client, docker_client
     )
+    control_app = _build_sandbox_api(service)
+    control_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=control_app),
+        base_url='http://sandbox.test/api/v1',
+    )
+    restarted_control_client: httpx.AsyncClient | None = None
 
     try:
         unrelated = docker_client.containers.run(
@@ -307,22 +360,24 @@ async def test_two_conversations_are_isolated_across_lifecycle_and_restart(
             'yes',
         )
 
-        first = await service.start_sandbox(sandbox_id='conversation-a')
+        first = await _api_start_sandbox(control_client)
         started_ids.append(first.id)
-        second = await service.start_sandbox(sandbox_id='conversation-b')
+        second = await _api_start_sandbox(control_client)
         started_ids.append(second.id)
 
         owned = _owned_containers(docker_client, prefix)
         assert {container.name for container in owned} == {first.id, second.id}
         assert len(owned) == 2
 
-        first_info = await _wait_for_running(service, first.id)
-        second_info = await _wait_for_running(service, second.id)
+        first_info = await _wait_for_api_running(control_client, first.id)
+        second_info = await _wait_for_api_running(control_client, second.id)
         assert first_info.id != second_info.id
         assert first_info.session_api_key
         assert second_info.session_api_key
         assert first_info.session_api_key != second_info.session_api_key
-        assert _url(first_info, AGENT_SERVER) != _url(second_info, AGENT_SERVER)
+        assert _exposed_url(first_info, AGENT_SERVER) != _exposed_url(
+            second_info, AGENT_SERVER
+        )
 
         first_container = docker_client.containers.get(first.id)
         second_container = docker_client.containers.get(second.id)
@@ -345,49 +400,68 @@ async def test_two_conversations_are_isolated_across_lifecycle_and_restart(
 
         # Pausing one runtime must not interrupt the other runtime or mutate its
         # marker, URLs, key, or namespaces.
-        assert await service.pause_sandbox(first.id)
-        paused = await service.get_sandbox(first.id)
+        await _api_action(control_client, 'POST', f'/sandboxes/{first.id}/pause')
+        paused = await _api_get_sandbox(control_client, first.id)
         assert paused is not None
         assert paused.status == SandboxStatus.PAUSED
-        unaffected = await _wait_for_running(service, second.id)
+        unaffected = await _wait_for_api_running(control_client, second.id)
         assert _snapshot(second_container, unaffected, second_snapshot.marker) == (
             second_snapshot
         )
 
-        # A fresh service instance represents Sandbox Server restart. It must
-        # rediscover both Docker containers, resume the paused one, and retain
-        # its session identity and writable marker.
-        discovered = await restarted_service.search_sandboxes()
+        # A fresh app and service instance represent Sandbox Server restart. It
+        # must rediscover both Docker containers, resume the paused one, and
+        # retain its session identity and writable marker.
+        restarted_control_app = _build_sandbox_api(restarted_service)
+        restarted_control_client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=restarted_control_app),
+            base_url='http://sandbox.test/api/v1',
+        )
+        assert restarted_control_client is not None
+        discovered = await _api_search_sandboxes(restarted_control_client)
         discovered_by_id = {info.id: info for info in discovered.items}
         assert set(discovered_by_id) == {first.id, second.id}
         assert discovered_by_id[first.id].status == SandboxStatus.PAUSED
         assert discovered_by_id[second.id].status == SandboxStatus.RUNNING
-        assert await restarted_service.resume_sandbox(first.id)
-        resumed_first = await _wait_for_running(restarted_service, first.id)
+        await _api_action(
+            restarted_control_client, 'POST', f'/sandboxes/{first.id}/resume'
+        )
+        resumed_first = await _wait_for_api_running(restarted_control_client, first.id)
         assert resumed_first.session_api_key == first_snapshot.session_api_key
-        assert _exec(first_container, ['cat', MARKER_PATH]) == first_snapshot.marker
+        assert _exec_checked(first_container, ['cat', MARKER_PATH]) == (
+            first_snapshot.marker
+        )
 
         # Simulate an externally stopped runtime, then verify restart discovery
         # still exposes the same resume contract.
         first_container.stop(timeout=10)
-        stopped = await restarted_service.get_sandbox(first.id)
+        stopped = await _api_get_sandbox(restarted_control_client, first.id)
         assert stopped is not None
         assert stopped.status == SandboxStatus.PAUSED
-        assert await restarted_service.resume_sandbox(first.id)
-        resumed_after_stop = await _wait_for_running(restarted_service, first.id)
-        assert resumed_after_stop.session_api_key == first_snapshot.session_api_key
-        assert _exec(first_container, ['cat', MARKER_PATH]) == first_snapshot.marker
+
+        # The second runtime remains reachable while the first is stopped.
         assert (
             _snapshot(
                 second_container,
-                await _wait_for_running(restarted_service, second.id),
+                await _wait_for_api_running(restarted_control_client, second.id),
                 second_snapshot.marker,
             )
             == second_snapshot
         )
 
-        assert await restarted_service.delete_sandbox(first.id)
-        assert await restarted_service.delete_sandbox(second.id)
+        await _api_action(
+            restarted_control_client, 'POST', f'/sandboxes/{first.id}/resume'
+        )
+        resumed_after_stop = await _wait_for_api_running(
+            restarted_control_client, first.id
+        )
+        assert resumed_after_stop.session_api_key == first_snapshot.session_api_key
+        assert _exec_checked(first_container, ['cat', MARKER_PATH]) == (
+            first_snapshot.marker
+        )
+
+        await _api_action(restarted_control_client, 'DELETE', f'/sandboxes/{first.id}')
+        await _api_action(restarted_control_client, 'DELETE', f'/sandboxes/{second.id}')
         assert _owned_containers(docker_client, prefix) == []
         assert docker_client.containers.get(unrelated.name).status == 'running'
         assert all(
@@ -404,5 +478,8 @@ async def test_two_conversations_are_isolated_across_lifecycle_and_restart(
         if unrelated is not None:
             with suppress(NotFound, DockerException):
                 unrelated.remove(force=True)
+        await control_client.aclose()
+        if restarted_control_client is not None:
+            await restarted_control_client.aclose()
         await httpx_client.aclose()
         await restarted_httpx_client.aclose()
