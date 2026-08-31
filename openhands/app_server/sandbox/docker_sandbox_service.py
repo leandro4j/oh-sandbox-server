@@ -519,9 +519,7 @@ class DockerSandboxService(SandboxService):
         # compatibility alias so the pinned image and older clients share the
         # same per-sandbox credential.
         env_vars[AGENT_SERVER_SESSION_API_KEY_VARIABLE] = session_api_key
-        env_vars[VSCODE_BASE_PATH_VARIABLE] = (
-            f'/vscode/{quote(container_name, safe="")}'
-        )
+        env_vars[VSCODE_BASE_PATH_VARIABLE] = self._get_vscode_base_path(container_name)
         env_vars[WEBHOOK_CALLBACK_VARIABLE] = (
             f'http://host.docker.internal:{self.host_port}/api/v1/webhooks'
         )

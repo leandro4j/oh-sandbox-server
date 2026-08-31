@@ -35,7 +35,14 @@ from docker.errors import (  # type: ignore[import-untyped]
     NotFound,
 )
 from fastapi import FastAPI
-from playwright.async_api import async_playwright, expect
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    Playwright,
+    async_playwright,
+    expect,
+)
 
 from openhands.app_server.sandbox import sandbox_router as sandbox_router_module
 from openhands.app_server.sandbox.docker_sandbox_service import (
@@ -234,7 +241,7 @@ def _url_is_unreachable(url: str) -> bool:
 
 
 async def _assert_editor_workspace(
-    page, url: str, expected_marker: str, reload: bool = False
+    page: Page, url: str, expected_marker: str, reload: bool = False
 ) -> None:
     if reload:
         await page.reload(wait_until='domcontentloaded', timeout=30000)
@@ -249,32 +256,29 @@ async def _assert_editor_workspace(
 
 
 async def _assert_editor_workspaces(
+    first_page: Page,
     first_url: str,
     first_marker: str,
+    second_page: Page,
     second_url: str,
     second_marker: str,
 ) -> None:
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True)
-        context = await browser.new_context()
-        try:
-            first_page = await context.new_page()
-            second_page = await context.new_page()
-            await asyncio.gather(
-                _assert_editor_workspace(first_page, first_url, first_marker),
-                _assert_editor_workspace(second_page, second_url, second_marker),
-            )
-            await asyncio.gather(
-                _assert_editor_workspace(
-                    first_page, first_url, first_marker, reload=True
-                ),
-                _assert_editor_workspace(
-                    second_page, second_url, second_marker, reload=True
-                ),
-            )
-        finally:
-            await context.close()
-            await browser.close()
+    await asyncio.gather(
+        _assert_editor_workspace(first_page, first_url, first_marker),
+        _assert_editor_workspace(second_page, second_url, second_marker),
+    )
+
+
+async def _assert_alternating_editor_reloads(
+    first_page: Page,
+    first_url: str,
+    first_marker: str,
+    second_page: Page,
+    second_url: str,
+    second_marker: str,
+) -> None:
+    await _assert_editor_workspace(first_page, first_url, first_marker, reload=True)
+    await _assert_editor_workspace(second_page, second_url, second_marker, reload=True)
 
 
 def _database_marker(url: str) -> str:
@@ -431,6 +435,9 @@ async def test_two_conversations_are_isolated_across_lifecycle_and_restart(
         base_url='http://sandbox.test/api/v1',
     )
     restarted_control_client: httpx.AsyncClient | None = None
+    playwright: Playwright | None = None
+    browser: Browser | None = None
+    browser_context: BrowserContext | None = None
 
     try:
         unrelated = docker_client.containers.run(
@@ -493,9 +500,24 @@ async def test_two_conversations_are_isolated_across_lifecycle_and_restart(
         second_snapshot = _snapshot(
             second_container, second_info, conversation_markers['conversation-b']
         )
+        playwright = await async_playwright().start()
+        browser = await playwright.chromium.launch(headless=True)
+        browser_context = await browser.new_context()
+        first_page = await browser_context.new_page()
+        second_page = await browser_context.new_page()
         await _assert_editor_workspaces(
+            first_page,
             first_snapshot.vscode_url,
             first_snapshot.marker,
+            second_page,
+            second_snapshot.vscode_url,
+            second_snapshot.marker,
+        )
+        await _assert_alternating_editor_reloads(
+            first_page,
+            first_snapshot.vscode_url,
+            first_snapshot.marker,
+            second_page,
             second_snapshot.vscode_url,
             second_snapshot.marker,
         )
@@ -542,6 +564,17 @@ async def test_two_conversations_are_isolated_across_lifecycle_and_restart(
         assert _exec_checked(first_container, ['cat', MARKER_PATH]) == (
             first_snapshot.marker
         )
+        # Keep one browser context across the pause/resume and control-plane
+        # restart, then alternate reloads to prove both paths still select the
+        # correct workspace without localhost cookie collisions.
+        await _assert_alternating_editor_reloads(
+            first_page,
+            first_snapshot.vscode_url,
+            first_snapshot.marker,
+            second_page,
+            second_snapshot.vscode_url,
+            second_snapshot.marker,
+        )
 
         # Simulate an externally stopped runtime, then verify restart discovery
         # still exposes the same resume contract.
@@ -585,6 +618,15 @@ async def test_two_conversations_are_isolated_across_lifecycle_and_restart(
             for sandbox_id in started_ids
         )
     finally:
+        if browser_context is not None:
+            with suppress(Exception):
+                await browser_context.close()
+        if browser is not None:
+            with suppress(Exception):
+                await browser.close()
+        if playwright is not None:
+            with suppress(Exception):
+                await playwright.stop()
         for sandbox_id in started_ids:
             with suppress(Exception):
                 await restarted_service.delete_sandbox(sandbox_id)
